@@ -2858,7 +2858,17 @@ int OnInit()
       _Symbol + "_" +
       IntegerToString((int)_Period);
 
-   CreateIndicatorHandle();
+   // Fix: do NOT create the indicator handle here. Creating an indicator
+   // (especially via iCustom(), which recursively runs the target
+   // indicator's own OnInit()) from inside an EA's OnInit() is a known
+   // Strategy Tester problem area -- history for the symbol/indicator can
+   // still be mid-sync at this exact point, and a nested OnInit failure
+   // there can surface as "tester stopped because OnInit failed" for this
+   // EA even though this function always returns INIT_SUCCEEDED. OnTick()
+   // below already retries CreateIndicatorHandle() every tick until it
+   // succeeds, so deferring to the first tick (well after history is
+   // ready) is both safe and sufficient -- this call was redundant here
+   // even before the iCustom fallback existed.
 
    Print(
       "MasterSRSignalOutcomeTracker initialized on ",
