@@ -21,9 +21,27 @@
 //|  6. The missing-rejection-candle penalty is a configurable,        |
 //|     softer default so a strong zone/trend confluence isn't vetoed  |
 //|     by the absence of a single-candle wick.                        |
+//|                                                                    |
+//| v2.51 follow-up fixes (review of the v2.50 defaults/lifecycle):    |
+//|  7. Historical load now REPLAYS decay/break/role-reversal          |
+//|     bar-by-bar over the lookback window instead of bulk-seeding    |
+//|     zones and validating them once against only the latest closed  |
+//|     price -- a level broken 100 bars ago no longer comes back as   |
+//|     "valid" just because price later drifted back inside its old   |
+//|     bounds.                                                        |
+//|  8. ATR multiplier defaults are recalibrated against a ~12-pip     |
+//|     ATR14 M15-major reference so v2.51 reproduces roughly v2.40's  |
+//|     fixed-pip behaviour under "normal" conditions, instead of      |
+//|     being quietly tighter until ATR reaches ~27-29 pips. Still a   |
+//|     starting point, not a backtested value -- validate per         |
+//|     symbol/timeframe.                                              |
+//|  9. CSV logs are per-symbol+timeframe by default, and opened with  |
+//|     FILE_SHARE_WRITE, so running this on several charts at once    |
+//|     (e.g. EURUSD/GBPUSD/USDJPY/USDCHF/AUDUSD/NZDUSD simultaneously) |
+//|     can't collide on one shared filename (the old ERR 5004 case).  |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "2.50"
+#property version   "2.51"
 #property indicator_chart_window
 #property indicator_plots   6
 #property indicator_buffers 14
@@ -64,22 +82,28 @@ input int      LookbackBars                 = 250;
 input int      SwingLeft                    = 3;
 input int      SwingRight                   = 3;
 
-//--- Fix #1: volatility normalization. Every *ATRMult input scales the
-//    threshold as a fraction of current ATR; the matching *Pips input is
-//    only a floor for very low-volatility symbols/timeframes so zones
-//    never collapse to (near) zero width.
+//--- Fix #1 (v2.50) + Fix #8 (v2.51): volatility normalization. Every
+//    *ATRMult input scales the threshold as a fraction of current ATR;
+//    the matching *Pips input is only a floor for very low-volatility
+//    symbols/timeframes so zones never collapse to (near) zero width.
+//    Multipliers are calibrated so that at a ~12-pip ATR14 reading (a
+//    typical M15 major) each threshold lands close to v2.40's old fixed
+//    pip default (10 / 4 / 2.5 / 8 / 12 / 12 respectively) -- so v2.51
+//    behaves like v2.40 under "normal" conditions and adapts away from
+//    it as volatility moves. This is a calibration starting point, not
+//    a backtested value: validate per symbol/timeframe before trusting it.
 input int      ATRPeriod                    = 14;
-input double   MergeDistanceATRMult         = 0.35;
+input double   MergeDistanceATRMult         = 0.83;
 input double   MinMergeDistancePips         = 4.0;
-input double   ZoneHalfWidthATRMult         = 0.15;
+input double   ZoneHalfWidthATRMult         = 0.33;
 input double   MinZoneHalfWidthPips         = 2.0;
-input double   BreakInvalidationATRMult     = 0.10;
+input double   BreakInvalidationATRMult     = 0.21;
 input double   MinBreakInvalidationPips     = 1.0;
-input double   SignalNearZoneATRMult        = 0.30;
+input double   SignalNearZoneATRMult        = 0.67;
 input double   MinSignalNearZonePips        = 3.0;
-input double   SignalResetDistanceATRMult   = 0.45;
+input double   SignalResetDistanceATRMult   = 1.00;
 input double   MinSignalResetDistancePips   = 5.0;
-input double   MinRoomATRMult               = 0.60;
+input double   MinRoomATRMult               = 1.00;
 input double   MinRoomPips                  = 6.0;
 
 input int      MaxSupportZonesToDraw        = 3;
@@ -224,6 +248,17 @@ double PipSize()
    if(_Digits == 3 || _Digits == 5)
       return _Point * 10.0;
    return _Point;
+}
+
+// Fix #7: refreshes g_atr_value from the bar at `shift`. Called both for
+// the live path (shift=1, the last closed bar) and, bar-by-bar, during
+// history replay -- so every distance threshold reflects the volatility
+// that was actually current at the point being processed, not today's
+// ATR retroactively applied to old pivots.
+void UpdateATR(const int shift)
+{
+   if(CopyBuffer(g_atr_handle, 0, shift, 1, g_atr_buffer) > 0)
+      g_atr_value = g_atr_buffer[0];
 }
 
 //--- ATR-scaled distance helpers (fix #1). Each takes the larger of the
@@ -451,32 +486,6 @@ void UpdateZonesIncremental(const double &high[],
       RegisterTouch(g_resistances, high[index], false, time[index]);
 }
 
-// One-time seed from full history on load (prev_calculated == 0), mirroring
-// what the old per-bar rebuild did, but only ever run once. All indices are
-// closed bars only (index >= SwingLeft+1), matching UpdateZonesIncremental.
-void SeedZonesFromHistory(const double &high[],
-                          const double &low[],
-                          const datetime &time[],
-                          const int rates_total)
-{
-   ArrayResize(g_supports, 0);
-   ArrayResize(g_resistances, 0);
-
-   int start = MathMin(LookbackBars, rates_total - SwingRight - 2);
-
-   if(start < SwingLeft + 1)
-      return;
-
-   for(int i = start; i >= SwingLeft + 1; i--)
-   {
-      if(IsSwingLow(low, i, rates_total))
-         RegisterTouch(g_supports, low[i], true, time[i]);
-
-      if(IsSwingHigh(high, i, rates_total))
-         RegisterTouch(g_resistances, high[i], false, time[i]);
-   }
-}
-
 // Fix #2: role reversal. A broken support doesn't just vanish -- classic
 // S/R theory treats a decisively broken level as flipping sides, so it is
 // carried into the opposite zone list with reduced credibility
@@ -563,6 +572,56 @@ void PruneStaleZones(MasterZone &zones[], const datetime current_time)
          ArrayResize(zones, ArraySize(zones) - 1);
       }
    }
+}
+
+// Fix #7: one-time history load on prev_calculated==0, but instead of
+// bulk-clustering every historical swing and validating the result once
+// against only the latest closed price (which let a level that broke 100
+// bars ago come back "valid" merely because price later drifted back
+// inside its old bounds), this REPLAYS the exact same bar-by-bar pipeline
+// the live path uses: decay, then swing registration, then invalidation
+// (with role-reversal) and pruning, using the ATR that was actually
+// current at each historical bar. A freshly loaded chart ends up in the
+// same zone state a chart that had been running the whole time would be
+// in, instead of a lifecycle-blind snapshot.
+void ReplayHistoryZones(const double &high[],
+                        const double &low[],
+                        const double &close[],
+                        const datetime &time[],
+                        const int rates_total)
+{
+   ArrayResize(g_supports, 0);
+   ArrayResize(g_resistances, 0);
+
+   int start = MathMin(LookbackBars, rates_total - SwingRight - 2);
+
+   if(start < SwingLeft + 1)
+   {
+      UpdateATR(1);
+      return;
+   }
+
+   for(int index = start; index >= SwingLeft + 1; index--)
+   {
+      UpdateATR(index);
+
+      DecayZones(g_supports);
+      DecayZones(g_resistances);
+
+      if(IsSwingLow(low, index, rates_total))
+         RegisterTouch(g_supports, low[index], true, time[index]);
+
+      if(IsSwingHigh(high, index, rates_total))
+         RegisterTouch(g_resistances, high[index], false, time[index]);
+
+      InvalidateAndReverseZones(close[index], time[index]);
+      PruneStaleZones(g_supports, time[index]);
+      PruneStaleZones(g_resistances, time[index]);
+   }
+
+   // Restore ATR to the latest closed bar for the rest of this OnCalculate
+   // call (the replay loop above left it at the oldest bar processed).
+   UpdateATR(1);
 }
 
 bool FindNearestSupport(const double price, MasterZone &result)
@@ -1186,6 +1245,22 @@ void DrawWaitingDashboard(const int rates_total,
 }
 
 //============================= CSV LOG ===============================
+// Fix #9 (v2.51): logs default to one file per symbol+timeframe, and are
+// opened with FILE_SHARE_WRITE. A single shared filename opened with only
+// FILE_SHARE_READ is the classic multi-chart ERR_CANNOT_OPEN_FILE (5004)
+// setup -- e.g. running this on EURUSD, GBPUSD, USDJPY, USDCHF, AUDUSD and
+// NZDUSD simultaneously, all writing to one common Files\ log.
+string BuildLogFileName(const string base_name)
+{
+   string base = base_name;
+   const int dot = StringFind(base, ".csv");
+
+   if(dot >= 0)
+      base = StringSubstr(base, 0, dot);
+
+   return base + "_" + _Symbol + "_" + EnumToString((ENUM_TIMEFRAMES)_Period) + ".csv";
+}
+
 int OpenSignalLog()
 {
    if(!EnableCSVSignalLog)
@@ -1196,13 +1271,14 @@ int OpenSignalLog()
       FILE_WRITE |
       FILE_CSV |
       FILE_ANSI |
-      FILE_SHARE_READ;
+      FILE_SHARE_READ |
+      FILE_SHARE_WRITE;
 
    if(LogToCommonFolder)
       flags |= FILE_COMMON;
 
    const int handle =
-      FileOpen(SignalLogFileName, flags, ';');
+      FileOpen(BuildLogFileName(SignalLogFileName), flags, ';');
 
    if(handle == INVALID_HANDLE)
       return INVALID_HANDLE;
@@ -1302,12 +1378,12 @@ int OpenSnapshotLog()
    if(!EnableClosedBarSnapshotLog)
       return INVALID_HANDLE;
 
-   int flags = FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ;
+   int flags = FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_SHARE_READ|FILE_SHARE_WRITE;
 
    if(LogToCommonFolder)
       flags |= FILE_COMMON;
 
-   const int handle = FileOpen(SnapshotLogFileName, flags, ';');
+   const int handle = FileOpen(BuildLogFileName(SnapshotLogFileName), flags, ';');
 
    if(handle == INVALID_HANDLE)
       return INVALID_HANDLE;
@@ -1520,17 +1596,19 @@ int OnCalculate(const int rates_total,
    {
       g_last_bar_time = time[0];
 
-      // ATR of the last CLOSED bar only -- never the forming bar -- so all
-      // distance thresholds derived from it are stable for the whole bar.
-      if(CopyBuffer(g_atr_handle, 0, 1, 1, g_atr_buffer) > 0)
-         g_atr_value = g_atr_buffer[0];
-
       if(prev_calculated == 0)
       {
-         SeedZonesFromHistory(high, low, time, rates_total);
+         // Fix #7: replay the full lookback bar-by-bar (decay, break,
+         // role-reversal) instead of bulk-seeding; leaves g_atr_value at
+         // the latest closed bar when it returns.
+         ReplayHistoryZones(high, low, close, time, rates_total);
       }
       else
       {
+         // ATR of the last CLOSED bar only -- never the forming bar -- so
+         // all distance thresholds derived from it are stable for the bar.
+         UpdateATR(1);
+
          DecayZones(g_supports);
          DecayZones(g_resistances);
          UpdateZonesIncremental(high, low, time, rates_total);
