@@ -44,7 +44,7 @@
 #property version   "2.51"
 #property indicator_chart_window
 #property indicator_plots   6
-#property indicator_buffers 14
+#property indicator_buffers 15
 
 //--- Plot 0: Buy signal
 #property indicator_label1  "BuySignal"
@@ -163,7 +163,7 @@ input bool     EnableClosedBarSnapshotLog    = true;
 input string   SnapshotLogFileName           = "MasterSR_v2_5_VolAdaptive_Snapshots.csv";
 
 //============================== BUFFERS ==============================
-// EA-facing contract (unchanged from v2.4):
+// EA-facing contract (v2.4 buffers 0-13 unchanged; 14 added in v2.51):
 //  0 BuySignal             price or EMPTY_VALUE
 //  1 SellSignal            price or EMPTY_VALUE
 //  2 SupportLow
@@ -178,6 +178,12 @@ input string   SnapshotLogFileName           = "MasterSR_v2_5_VolAdaptive_Snapsh
 // 11 SellScore             0..10
 // 12 Decision              +1 BUY, -1 SELL, 0 WAIT
 // 13 ZoneState             +1 near support, -1 near resistance, 0 neither
+// 14 SignalNearZoneDistance  price units (divide by pip size for pips) --
+//    the live ATR-scaled threshold ComputeScores()/ZoneState actually used
+//    for "near zone" this bar. Exists so an external tracker/EA can judge
+//    zone proximity against the SAME threshold the indicator used, instead
+//    of guessing with its own hardcoded pip constant that drifts out of
+//    sync as ATR moves.
 double BuySignalBuffer[];
 double SellSignalBuffer[];
 double SupportLowBuffer[];
@@ -192,6 +198,7 @@ double BuyScoreBuffer[];
 double SellScoreBuffer[];
 double DecisionBuffer[];
 double ZoneStateBuffer[];
+double SignalNearZoneBuffer[];
 
 //============================== TYPES ===============================
 enum ENUM_MASTER_ZONE_STATE
@@ -1491,6 +1498,7 @@ int OnInit()
    SetIndexBuffer(11, SellScoreBuffer, INDICATOR_CALCULATIONS);
    SetIndexBuffer(12, DecisionBuffer, INDICATOR_CALCULATIONS);
    SetIndexBuffer(13, ZoneStateBuffer, INDICATOR_CALCULATIONS);
+   SetIndexBuffer(14, SignalNearZoneBuffer, INDICATOR_CALCULATIONS);
 
    ArraySetAsSeries(BuySignalBuffer, true);
    ArraySetAsSeries(SellSignalBuffer, true);
@@ -1506,6 +1514,7 @@ int OnInit()
    ArraySetAsSeries(SellScoreBuffer, true);
    ArraySetAsSeries(DecisionBuffer, true);
    ArraySetAsSeries(ZoneStateBuffer, true);
+   ArraySetAsSeries(SignalNearZoneBuffer, true);
 
    PlotIndexSetInteger(0, PLOT_ARROW, 233);
    PlotIndexSetInteger(1, PLOT_ARROW, 234);
@@ -1597,6 +1606,7 @@ int OnCalculate(const int rates_total,
       ArrayInitialize(SellScoreBuffer, 0.0);
       ArrayInitialize(DecisionBuffer, 0.0);
       ArrayInitialize(ZoneStateBuffer, 0.0);
+      ArrayInitialize(SignalNearZoneBuffer, 0.0);
    }
 
    const bool new_bar =
@@ -1755,6 +1765,8 @@ int OnCalculate(const int rates_total,
 
    const double near_distance =
       SignalNearZoneDistance();
+
+   SignalNearZoneBuffer[bar] = near_distance;
 
    const bool near_support =
       has_support &&
