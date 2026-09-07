@@ -574,16 +574,24 @@ void PruneStaleZones(MasterZone &zones[], const datetime current_time)
    }
 }
 
-// Fix #7: one-time history load on prev_calculated==0, but instead of
-// bulk-clustering every historical swing and validating the result once
-// against only the latest closed price (which let a level that broke 100
-// bars ago come back "valid" merely because price later drifted back
-// inside its old bounds), this REPLAYS the exact same bar-by-bar pipeline
-// the live path uses: decay, then swing registration, then invalidation
-// (with role-reversal) and pruning, using the ATR that was actually
-// current at each historical bar. A freshly loaded chart ends up in the
-// same zone state a chart that had been running the whole time would be
-// in, instead of a lifecycle-blind snapshot.
+// Fix #7 (v2.51) + confirmation-lag fix (v2.52): one-time history load on
+// prev_calculated==0, replaying the exact bar-by-bar pipeline the live path
+// uses -- decay, then swing confirmation, then invalidation (with
+// role-reversal) and pruning -- using the ATR that was actually current at
+// each historical bar, instead of bulk-clustering every historical swing
+// and validating the result once against only the latest closed price.
+//
+// Confirmation timing matters here and was wrong in the first version of
+// this replay: UpdateZonesIncremental() only ever checks relative index
+// SwingLeft+1, i.e. live operation doesn't learn that bar P was a swing
+// pivot until SwingLeft MORE bars have closed after P. The loop below
+// tracks that explicitly with two indices -- `now_index` (simulated
+// "present", walked forward from the oldest bar down to the true present
+// at 1, so every closed bar gets its own decay/invalidate/prune pass, none
+// skipped at the tail) and `pivot_index = now_index + SwingLeft` (the bar
+// whose swing status becomes knowable at that "present" moment) -- so a
+// pivot is never merged, decayed, or eligible to break/reverse before the
+// bars that actually confirm it have closed, matching live timing exactly.
 void ReplayHistoryZones(const double &high[],
                         const double &low[],
                         const double &close[],
@@ -593,35 +601,38 @@ void ReplayHistoryZones(const double &high[],
    ArrayResize(g_supports, 0);
    ArrayResize(g_resistances, 0);
 
-   int start = MathMin(LookbackBars, rates_total - SwingRight - 2);
+   const int max_pivot_index = MathMin(LookbackBars, rates_total - SwingRight - 2);
+   const int start_now = max_pivot_index - SwingLeft;
 
-   if(start < SwingLeft + 1)
+   if(start_now < 1)
    {
       UpdateATR(1);
       return;
    }
 
-   for(int index = start; index >= SwingLeft + 1; index--)
+   for(int now_index = start_now; now_index >= 1; now_index--)
    {
-      UpdateATR(index);
+      UpdateATR(now_index);
 
       DecayZones(g_supports);
       DecayZones(g_resistances);
 
-      if(IsSwingLow(low, index, rates_total))
-         RegisterTouch(g_supports, low[index], true, time[index]);
+      const int pivot_index = now_index + SwingLeft;
 
-      if(IsSwingHigh(high, index, rates_total))
-         RegisterTouch(g_resistances, high[index], false, time[index]);
+      if(IsSwingLow(low, pivot_index, rates_total))
+         RegisterTouch(g_supports, low[pivot_index], true, time[pivot_index]);
 
-      InvalidateAndReverseZones(close[index], time[index]);
-      PruneStaleZones(g_supports, time[index]);
-      PruneStaleZones(g_resistances, time[index]);
+      if(IsSwingHigh(high, pivot_index, rates_total))
+         RegisterTouch(g_resistances, high[pivot_index], false, time[pivot_index]);
+
+      InvalidateAndReverseZones(close[now_index], time[now_index]);
+      PruneStaleZones(g_supports, time[now_index]);
+      PruneStaleZones(g_resistances, time[now_index]);
    }
 
-   // Restore ATR to the latest closed bar for the rest of this OnCalculate
-   // call (the replay loop above left it at the oldest bar processed).
-   UpdateATR(1);
+   // The loop's last iteration (now_index == 1) already left g_atr_value,
+   // and the zone set, exactly where the live path would leave them after
+   // processing the current latest closed bar -- nothing further to do.
 }
 
 bool FindNearestSupport(const double price, MasterZone &result)
@@ -1599,8 +1610,10 @@ int OnCalculate(const int rates_total,
       if(prev_calculated == 0)
       {
          // Fix #7: replay the full lookback bar-by-bar (decay, break,
-         // role-reversal) instead of bulk-seeding; leaves g_atr_value at
-         // the latest closed bar when it returns.
+         // role-reversal, confirmation-lag-correct swing timing) instead
+         // of bulk-seeding. Self-contained: its last iteration already
+         // invalidates/prunes against the current latest closed bar, so
+         // nothing further is needed here.
          ReplayHistoryZones(high, low, close, time, rates_total);
       }
       else
@@ -1612,11 +1625,12 @@ int OnCalculate(const int rates_total,
          DecayZones(g_supports);
          DecayZones(g_resistances);
          UpdateZonesIncremental(high, low, time, rates_total);
+
+         InvalidateAndReverseZones(close[1], time[1]);
+         PruneStaleZones(g_supports, time[1]);
+         PruneStaleZones(g_resistances, time[1]);
       }
 
-      InvalidateAndReverseZones(close[1], time[1]);
-      PruneStaleZones(g_supports, time[1]);
-      PruneStaleZones(g_resistances, time[1]);
       DrawNearestZones(close[1]);
 
       // clear only newest slots so stale arrows can't bleed forward
