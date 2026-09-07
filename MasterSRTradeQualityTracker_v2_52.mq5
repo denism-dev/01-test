@@ -12,7 +12,12 @@
 // Prefer reading the indicator already attached to the chart.
 input string AttachedIndicatorShortName = "Master S/R Confluence v2.52 VolAdaptive";
 
-// Attached-only mode: no iCustom fallback instance is created.
+// Fix: iCustom fallback -- used only if no attached instance is found (see
+// TryICustomIndicator / CreateIndicatorHandle below). Unlike the attached
+// path, this needs no chart, so it's what makes fast/non-visual backtests
+// and Strategy Tester optimization possible.
+input bool   UseICustomFallback         = true;
+input string IndicatorFileName          = "MasterSRConfluenceIndicator_v2_5_VolAdaptive";
 
 // v2.52 EA-facing buffers (same 14-buffer contract as v2.4, plus the
 // v2.51 SignalNearZoneDistance buffer at index 14)
@@ -961,6 +966,28 @@ int OpenCsv(const string filename)
    return handle;
 }
 
+// Fix: uploaded CSVs from a prior run came back as the right file size but
+// 100% null bytes -- correct-looking size with zero real content, which
+// points at something zeroing the file AFTER MQL5 wrote it (a cloud-sync
+// placeholder, e.g. OneDrive Files On-Demand, or antivirus quarantine)
+// rather than a write failure in this code. This can't fix an external
+// cause, but it gives a definitive signal in the Journal either way: if
+// FileWrite itself ever reports 0 bytes, that IS a real bug here and this
+// will say so with the error code; if it always reports success but the
+// exported file is still empty, that confirms the problem is external.
+void VerifyCsvWrite(const int handle, const string context, const uint bytes_written)
+{
+   if(bytes_written == 0)
+   {
+      Print("OutcomeTracker: FileWrite wrote 0 bytes for ", context,
+            " -- write failed. error=", GetLastError());
+      return;
+   }
+
+   Print("OutcomeTracker: ", context, " wrote ", bytes_written,
+         " bytes this call, file now ", FileSize(handle), " bytes total.");
+}
+
 void LogSignalEvent(const VirtualSignal &s)
 {
    const int handle = OpenCsv(SignalEventsFileName);
@@ -989,7 +1016,7 @@ void LogSignalEvent(const VirtualSignal &s)
 
    FileSeek(handle, 0, SEEK_END);
 
-   FileWrite(
+   const uint bytes_written = FileWrite(
       handle,
       StringFormat("%I64d", s.id),
       TimeToString(s.entry_time, TIME_DATE|TIME_SECONDS),
@@ -1052,6 +1079,8 @@ void LogSignalEvent(const VirtualSignal &s)
       DoubleToString(s.tp2_price, _Digits)
    );
 
+   VerifyCsvWrite(handle, "Signals row", bytes_written);
+
    FileFlush(handle);
    FileClose(handle);
 }
@@ -1090,7 +1119,7 @@ void LogCompletedResult(const VirtualSignal &s,
 
    FileSeek(handle, 0, SEEK_END);
 
-   FileWrite(
+   const uint bytes_written = FileWrite(
       handle,
       StringFormat("%I64d", s.id),
       TimeToString(s.signal_bar_time, TIME_DATE|TIME_MINUTES),
@@ -1164,6 +1193,8 @@ void LogCompletedResult(const VirtualSignal &s,
       close_reason
    );
 
+   VerifyCsvWrite(handle, "Results row", bytes_written);
+
    FileFlush(handle);
    FileClose(handle);
 }
@@ -1193,7 +1224,7 @@ void LogOptimizationResult(const VirtualSignal &s,
 
    FileSeek(handle,0,SEEK_END);
 
-   FileWrite(
+   const uint bytes_written = FileWrite(
       handle,
       StringFormat("%I64d",s.id),
       TimeToString(s.entry_time,TIME_DATE|TIME_SECONDS),
@@ -1226,6 +1257,8 @@ void LogOptimizationResult(const VirtualSignal &s,
       OutcomeName(s.outcome_10p),
       close_reason
    );
+
+   VerifyCsvWrite(handle, "Diagnostics row", bytes_written);
 
    FileFlush(handle);
    FileClose(handle);
@@ -2732,6 +2765,51 @@ bool TryAttachedIndicator(const string short_name)
    return true;
 }
 
+// Fix: loads the indicator programmatically via iCustom() instead of
+// requiring it to already be manually attached to a chart. Attempts 1-3
+// above (TryAttachedIndicator) all need a chart with the indicator dropped
+// on it, which is fine for a live/demo chart but means the tracker cannot
+// run in fast/non-visual backtest mode, and CANNOT run under Strategy
+// Tester optimization at all (optimization agents have no chart). This
+// fallback unlocks both. It uses the indicator's own compiled default
+// inputs (iCustom with no extra parameters after the path) -- if you need
+// non-default indicator settings for a backtest, either attach it manually
+// with those settings in Visual Mode (path 1-3), or change the defaults
+// in the indicator's own source and recompile.
+bool TryICustomIndicator(const string relative_path)
+{
+   if(relative_path == "")
+      return false;
+
+   ResetLastError();
+
+   const int handle = iCustom(_Symbol, _Period, relative_path);
+
+   if(handle == INVALID_HANDLE)
+      return false;
+
+   // The indicator may not have finished its initial history calculation
+   // yet (most likely right after OnInit, especially in the tester). Don't
+   // adopt the handle until it has actually produced values. iCustom reuses
+   // the same underlying instance on repeat calls with identical
+   // parameters, so retrying this every OnTick (via the caller) doesn't
+   // create duplicate copies while it warms up.
+   if(BarsCalculated(handle) <= 0)
+   {
+      IndicatorRelease(handle);
+      return false;
+   }
+
+   g_indicator_handle = handle;
+
+   Print(
+      "OutcomeTracker v2.52: connected via iCustom fallback: ",
+      relative_path
+   );
+
+   return true;
+}
+
 bool CreateIndicatorHandle()
 {
    // 1) User-configurable exact short name.
@@ -2750,9 +2828,17 @@ bool CreateIndicatorHandle()
       TryAttachedIndicator("Master S/R Confluence v2.5 VolAdaptive"))
       return true;
 
+   // 4) iCustom fallback -- works with no chart at all, so this is what
+   //    makes fast-mode backtesting and Strategy Tester optimization work.
+   if(UseICustomFallback &&
+      TryICustomIndicator(IndicatorFileName))
+      return true;
+
    Print(
-      "OutcomeTracker v2.52: attached VolAdaptive indicator not found. ",
-      "Attach MasterSRConfluenceIndicator_v2_52_VolAdaptive to this chart first."
+      "OutcomeTracker v2.52: no VolAdaptive indicator found -- neither ",
+      "attached to this chart nor loadable via iCustom('", IndicatorFileName, "'). ",
+      "Either attach it manually, or set IndicatorFileName to its compiled ",
+      ".ex5 name (include a subfolder path if it's not directly in MQL5\\Indicators\\)."
    );
 
    return false;
