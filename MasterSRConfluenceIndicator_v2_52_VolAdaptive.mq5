@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//|           MasterSRConfluenceIndicator_v2_5_VolAdaptive.mq5        |
+//|           MasterSRConfluenceIndicator_v2_52_VolAdaptive.mq5       |
 //| Master S/R indicator with clean dashboard, de-dup signals,        |
 //| closed-candle confirmation, and EA-ready buffers.                  |
 //|                                                                     |
@@ -41,7 +41,7 @@
 //|     can't collide on one shared filename (the old ERR 5004 case).  |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "2.51"
+#property version   "2.52"
 #property indicator_chart_window
 #property indicator_plots   6
 #property indicator_buffers 15
@@ -166,9 +166,9 @@ input bool     DrawDashboard                = true;
 
 input bool     EnableCSVSignalLog           = true;
 input bool     LogToCommonFolder            = true;
-input string   SignalLogFileName            = "MasterSR_v2_5_VolAdaptive_Signals.csv";
+input string   SignalLogFileName            = "MasterSR_v2_52_VolAdaptive_Signals.csv";
 input bool     EnableClosedBarSnapshotLog    = true;
-input string   SnapshotLogFileName           = "MasterSR_v2_5_VolAdaptive_Snapshots.csv";
+input string   SnapshotLogFileName           = "MasterSR_v2_52_VolAdaptive_Snapshots.csv";
 
 //============================== BUFFERS ==============================
 // EA-facing contract (v2.4 buffers 0-13 unchanged; 14 added in v2.51):
@@ -1156,7 +1156,7 @@ void DrawMasterDashboard(const string status_text,
    else if(StringFind(status_text, "LOCKED") >= 0)
       status_color = clrGold;
 
-   SetDashboardLine(0, "MASTER S/R CONFLUENCE v2.5 VOL-ADAPTIVE", clrWhite, 10);
+   SetDashboardLine(0, "MASTER S/R CONFLUENCE v2.52 VOL-ADAPTIVE", clrWhite, 10);
    SetDashboardLine(1, "STATUS: " + status_text, status_color, 10);
 
    SetDashboardLine(
@@ -1254,7 +1254,7 @@ void DrawWaitingDashboard(const int rates_total,
    if(!DrawDashboard)
       return;
 
-   SetDashboardLine(0, "MASTER S/R CONFLUENCE v2.5 VOL-ADAPTIVE", clrWhite, 10);
+   SetDashboardLine(0, "MASTER S/R CONFLUENCE v2.52 VOL-ADAPTIVE", clrWhite, 10);
    SetDashboardLine(1, "STATUS: WAITING FOR PRICE HISTORY", clrGold, 10);
    SetDashboardLine(
       2,
@@ -1535,7 +1535,7 @@ int OnInit()
 
    IndicatorSetString(
       INDICATOR_SHORTNAME,
-      "Master S/R Confluence v2.5 VolAdaptive"
+      "Master S/R Confluence v2.52 VolAdaptive"
    );
 
    g_atr_handle = iATR(_Symbol, _Period, ATRPeriod);
