@@ -147,6 +147,14 @@ input double   ScoreRejectionBonus          = 2.0;
 input double   ScoreRejectionMissingPenalty = -1.0;
 input double   ScoreBreakoutBonus           = 1.0;
 input double   ScoreTightRoomPenalty        = -1.0;
+// Fix: ScoreTightRoomPenalty only ever nudges the score down by a point --
+// a signal scoring well on trend/rejection/strength can still clear
+// MinimumScoreToSignal despite a near-zero gap between support and
+// resistance, where the fixed 5p/6p/8p/10p targets stop meaning "reached
+// the opposite zone" and start meaning "broke through the very zone that
+// justified the trade." RequireAdequateRoom makes that a hard veto instead
+// of a soft penalty, using the same MinRoomDistance() threshold.
+input bool     RequireAdequateRoom          = true;
 
 input bool     ConfirmOnClosedCandle        = true;
 
@@ -1788,15 +1796,29 @@ int OnCalculate(const int rates_total,
    // default decision
    int decision = 0;
 
+   // Hard room veto (see RequireAdequateRoom above): only evaluable when
+   // both zones exist and are correctly ordered, same as the soft penalty
+   // in ComputeScores(). When the gap isn't measurable, this doesn't block
+   // the trade -- absence of information isn't evidence the room is bad.
+   const bool room_measurable =
+      has_support && has_resistance && resistance.low > support.high;
+
+   const bool room_adequate =
+      !RequireAdequateRoom ||
+      !room_measurable ||
+      (resistance.low - support.high) >= MinRoomDistance();
+
    const bool raw_buy =
       near_support &&
       buy_score >= MinimumScoreToSignal &&
-      buy_score > sell_score;
+      buy_score > sell_score &&
+      room_adequate;
 
    const bool raw_sell =
       near_resistance &&
       sell_score >= MinimumScoreToSignal &&
-      sell_score > buy_score;
+      sell_score > buy_score &&
+      room_adequate;
 
    bool emit_buy = false;
    bool emit_sell = false;
