@@ -17,7 +17,7 @@ input string AttachedIndicatorShortName = "Master S/R Confluence v2.52 VolAdapti
 // path, this needs no chart, so it's what makes fast/non-visual backtests
 // and Strategy Tester optimization possible.
 input bool   UseICustomFallback         = true;
-input string IndicatorFileName          = "MasterSRConfluenceIndicator_v2_5_VolAdaptive";
+input string IndicatorFileName          = "MasterSRConfluenceIndicator_v2_52_VolAdaptive";
 
 // v2.52 EA-facing buffers (same 14-buffer contract as v2.4, plus the
 // v2.51 SignalNearZoneDistance buffer at index 14)
