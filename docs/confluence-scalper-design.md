@@ -175,18 +175,85 @@ claims attached, without actually producing any of them:
   timezones so they stay aligned through DST rather than drifting against
   fixed UTC offsets.
 
-## 9. Known limitations / what's still unverified
+## 9. Round-2 fixes (from a second review pass)
+
+A second review of the strategy conversion caught issues in how it measured
+itself, not just in the trading logic:
+
+- **Intrabar mode was a dead toggle.** `calc_on_every_tick` was left `false`,
+  so TradingView only recalculated the script at bar close regardless of
+  the "Evaluate on" setting. Now `calc_on_every_tick = true` at the
+  strategy level, so Intrabar mode actually recalculates every tick. Note
+  this makes Intrabar mode a forward/live-testing option, not an
+  equivalent historical backtest mode — historical bars can't fully
+  reproduce realtime tick sequencing. Closed Bar mode is unaffected, since
+  it's still gated to the bar-close tick regardless.
+- **SL/TP were computed from the signal bar's close, not the actual fill.**
+  A market order fills on the next available price the broker emulator
+  sees, not the signal candle's close, so the original R-multiples drifted
+  from what was configured. ATR is now captured at signal time but the
+  stop/target prices are computed from `strategy.position_avg_price` once
+  the fill is confirmed.
+- **The TP1/TP2/SL stats table couldn't actually tell a stop-out from a
+  target hit.** Both exit legs shared a stop price under the same order
+  IDs ("TP1"/"TP2"), and no exit order was ever named "SL" — so
+  `exit_id == "SL"` never matched anything and stop-outs were silently
+  counted as target hits. Fixed using `comment_profit`/`comment_loss` on
+  each `strategy.exit()` call and reading `strategy.closedtrades.exit_comment()`
+  instead of `exit_id()`.
+- **A deeper version of the same bug**: because TP1 and TP2 are separate
+  `strategy.exit()` calls, a single logical trade produces *two* rows in
+  `strategy.closedtrades` (one per leg) — so index-matching entries 1:1
+  against closed-trade rows (the original approach) was wrong regardless of
+  the id/comment issue. Fixed by attributing every newly-closed row
+  incrementally to whichever entry is currently open, rather than assuming
+  a fixed row count per entry.
+- **"Max Drawdown" was actually current drawdown-from-peak** — it read 0%
+  right after any new equity high, understating a strategy that dropped
+  20% and later recovered. Now tracks a running maximum across the whole
+  test.
+- **No slippage was modeled**, only commission. Added a slippage (ticks)
+  input on the strategy declaration.
+- **The London/NY-overlap session tag was structured as if the two windows
+  could coincide**; given the configured local-time windows they can't, so
+  the compound case was dead logic. Simplified to two mutually exclusive
+  tags.
+
+## 10. This is not the same strategy as the first draft — test both
+
+Hardening the indicator-only draft into a strategy also changed what it
+trades, not just how it's measured: the default timing trigger narrowed
+from "EMA cross OR Stoch cross OR squeeze release" to EMA-cross-only
+(`useFastTriggers = false`), and `requireConfirmation = true` now demands
+zone or volume support that the original never required. Both are
+defensible tightening, but treat this as a new strategy to validate, not a
+transparent instrumentation of the old one — run both configurations and
+compare rather than assuming the tightened version is better:
+
+| Input | Baseline (reproduces the original concept) | Experimental (hardened defaults) |
+|---|---|---|
+| Entry Score Threshold | 70 | 70 |
+| Require price-action confirmation | OFF | ON |
+| Allow Stoch/squeeze as timing triggers | ON | OFF |
+| Same-direction cooldown | 0 | 3 |
+| Opposite-direction cooldown | 5 | 5 |
+| Signal Evaluation | Closed Bar | Closed Bar |
+
+## 11. Known limitations / what's still unverified
 
 - The script has not been compiled or run in TradingView's Pine Editor —
   syntax and runtime behavior (especially the paired-`strategy.exit`
-  bracket pattern for TP1/TP2 sharing one stop) should be verified there
-  before trusting any output.
+  bracket pattern for TP1/TP2 sharing one stop, and whether
+  `strategy.close()`'s `comment` argument surfaces through
+  `exit_comment()` the way the Confluence/Other bucket assumes) should be
+  verified there before trusting any output.
 - No backtest has been run. Nothing in this document or the code is
   evidence the strategy is profitable — that can only come from running it
   per the validation plan in Section 7, across multiple instruments,
   timeframes, and regimes, with walk-forward re-optimization of the
-  component weights.
-- The by-session and TP1/TP2/SL breakdown logic assumes trades close in
-  the same order they open (`pyramiding = 0`, one open position at a
-  time). If that assumption is relaxed, the array-index matching those
-  breakdowns rely on would need to be redone with per-trade IDs instead.
+  component weights, and with the baseline-vs-experimental comparison in
+  Section 10 run before trusting that the hardening actually helped.
+- The by-entry P&L attribution assumes `pyramiding = 0` (one open position
+  at a time), so every closed-trade row can be unambiguously attributed to
+  "whichever entry is currently open." If pyramiding is ever enabled, this
+  would need per-trade IDs instead of the current single `currentEntryIdx`.
