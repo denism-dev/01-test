@@ -1,0 +1,280 @@
+//@version=5
+indicator("Confluence Scalper", overlay=true, max_labels_count=500)
+
+// =============================================================================
+// Confluence Scalper
+// Combines trend, momentum, volatility-squeeze, volume and price-action/
+// liquidity confirmations into a single weighted score, and only fires a
+// signal when the score clears a threshold AND a timing trigger occurs on
+// the same bar. See docs/confluence-scalper-design.md for the full design.
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+grpWeights = "Component Weights (sum should be ~100)"
+wTrend   = input.int(20, "EMA Ribbon Trend", group = grpWeights)
+wVwap    = input.int(15, "VWAP Position", group = grpWeights)
+wStoch   = input.int(15, "Stochastic RSI Cross", group = grpWeights)
+wMacd    = input.int(10, "MACD Histogram", group = grpWeights)
+wSqueeze = input.int(15, "BB/KC Squeeze Release", group = grpWeights)
+wVolume  = input.int(15, "Volume / Pressure", group = grpWeights)
+wZone    = input.int(10, "Liquidity Zone + Rejection", group = grpWeights)
+
+grpGate = "Signal Gating"
+entryThreshold  = input.int(70, "Entry Score Threshold", minval = 1, maxval = 100, group = grpGate)
+strongThreshold = input.int(85, "Strong Signal Score Threshold", minval = 1, maxval = 100, group = grpGate)
+exitThreshold   = input.int(40, "Exit Score Threshold", minval = 1, maxval = 100, group = grpGate)
+cooldownBars    = input.int(5, "Cooldown Bars Between Opposite Signals", minval = 0, group = grpGate)
+
+grpSession = "Session Filter"
+useSessionFilter = input.bool(true, "Restrict signals to high-liquidity sessions", group = grpSession)
+londonSession = input.session("0700-1000", "London Session (UTC)", group = grpSession)
+nyOverlap     = input.session("1200-1500", "NY/London Overlap (UTC)", group = grpSession)
+
+grpRisk = "Risk Overlay"
+atrLen      = input.int(14, "ATR Length", group = grpRisk)
+atrStopMult = input.float(1.2, "Stop Distance (x ATR)", group = grpRisk)
+rr1         = input.float(1.5, "Take Profit 1 (R multiple)", group = grpRisk)
+rr2         = input.float(2.5, "Take Profit 2 (R multiple)", group = grpRisk)
+
+grpZone = "Liquidity Zone"
+pivotLen   = input.int(10, "Pivot Lookback (each side)", group = grpZone)
+zoneAtrMul = input.float(0.5, "Zone Proximity (x ATR)", group = grpZone)
+
+// ---------------------------------------------------------------------------
+// 1. Trend: EMA ribbon
+// ---------------------------------------------------------------------------
+ema9  = ta.ema(close, 9)
+ema21 = ta.ema(close, 21)
+ema50 = ta.ema(close, 50)
+
+trendBull = ema9 > ema21 and ema21 > ema50 and close > ema9
+trendBear = ema9 < ema21 and ema21 < ema50 and close < ema9
+
+// ---------------------------------------------------------------------------
+// 2. VWAP position (session VWAP)
+// ---------------------------------------------------------------------------
+vwapVal = ta.vwap(hlc3)
+vwapBull = close > vwapVal
+vwapBear = close < vwapVal
+
+// ---------------------------------------------------------------------------
+// 3. Stochastic RSI cross (timing trigger)
+// ---------------------------------------------------------------------------
+rsiSrc = close
+rsiLen = 14
+stochLen = 14
+smoothK = 3
+smoothD = 3
+rsi1 = ta.rsi(rsiSrc, rsiLen)
+stochRsi = ta.stoch(rsi1, rsi1, rsi1, stochLen)
+kLine = ta.sma(stochRsi, smoothK)
+dLine = ta.sma(kLine, smoothD)
+
+stochCrossUp   = ta.crossover(kLine, dLine) and kLine < 30
+stochCrossDown = ta.crossunder(kLine, dLine) and kLine > 70
+stochBull = kLine > dLine
+stochBear = kLine < dLine
+
+// ---------------------------------------------------------------------------
+// 4. MACD histogram slope
+// ---------------------------------------------------------------------------
+[macdLine, signalLine, histLine] = ta.macd(close, 12, 26, 9)
+macdBull = histLine > histLine[1] and (histLine > 0 or histLine > histLine[2])
+macdBear = histLine < histLine[1] and (histLine < 0 or histLine < histLine[2])
+
+// ---------------------------------------------------------------------------
+// 5. BB / KC squeeze release (breakout timing trigger)
+// ---------------------------------------------------------------------------
+bbLen = 20
+bbMult = 2.0
+basis = ta.sma(close, bbLen)
+dev = bbMult * ta.stdev(close, bbLen)
+bbUpper = basis + dev
+bbLower = basis - dev
+
+kcMult = 1.5
+rangeMa = ta.sma(ta.tr, bbLen)
+kcUpper = basis + rangeMa * kcMult
+kcLower = basis - rangeMa * kcMult
+
+squeezeOn = bbLower > kcLower and bbUpper < kcUpper
+squeezeReleaseUp   = squeezeOn[1] and not squeezeOn and close > bbUpper
+squeezeReleaseDown = squeezeOn[1] and not squeezeOn and close < bbLower
+
+bbWidth = (bbUpper - bbLower) / basis
+squeezeBull = squeezeReleaseUp or (not squeezeOn and bbWidth > bbWidth[1] and close > basis)
+squeezeBear = squeezeReleaseDown or (not squeezeOn and bbWidth > bbWidth[1] and close < basis)
+
+// ---------------------------------------------------------------------------
+// 6. Volume / pressure confirmation
+// ---------------------------------------------------------------------------
+volSma = ta.sma(volume, 20)
+volSpike = volume > volSma * 1.5
+candleRange = high - low
+pressure = candleRange == 0 ? 0.5 : (close - low) / candleRange
+volumeBull = volSpike and pressure > 0.66
+volumeBear = volSpike and pressure < 0.33
+
+// ---------------------------------------------------------------------------
+// 7. Liquidity zone + rejection price action
+// ---------------------------------------------------------------------------
+atrVal = ta.atr(atrLen)
+pivotLow  = ta.pivotlow(low, pivotLen, pivotLen)
+pivotHigh = ta.pivothigh(high, pivotLen, pivotLen)
+
+var float lastPivotLow = na
+var float lastPivotHigh = na
+if not na(pivotLow)
+    lastPivotLow := pivotLow
+if not na(pivotHigh)
+    lastPivotHigh := pivotHigh
+
+nearSupport    = not na(lastPivotLow) and math.abs(low - lastPivotLow) <= atrVal * zoneAtrMul
+nearResistance = not na(lastPivotHigh) and math.abs(high - lastPivotHigh) <= atrVal * zoneAtrMul
+
+bodyTop = math.max(open, close)
+bodyBot = math.min(open, close)
+bullPinBar  = (bodyBot - low) > (candleRange * 0.5) and close > open
+bearPinBar  = (high - bodyTop) > (candleRange * 0.5) and close < open
+bullEngulf  = close > open and close[1] < open[1] and close > open[1] and open < close[1]
+bearEngulf  = close < open and close[1] > open[1] and close < open[1] and open > close[1]
+
+zoneBull = nearSupport and (bullPinBar or bullEngulf)
+zoneBear = nearResistance and (bearPinBar or bearEngulf)
+
+// ---------------------------------------------------------------------------
+// Confluence score
+// ---------------------------------------------------------------------------
+totalWeight = wTrend + wVwap + wStoch + wMacd + wSqueeze + wVolume + wZone
+
+bullScore = (trendBull ? wTrend : 0) + (vwapBull ? wVwap : 0) + (stochBull ? wStoch : 0) +
+             (macdBull ? wMacd : 0) + (squeezeBull ? wSqueeze : 0) + (volumeBull ? wVolume : 0) +
+             (zoneBull ? wZone : 0)
+bearScore = (trendBear ? wTrend : 0) + (vwapBear ? wVwap : 0) + (stochBear ? wStoch : 0) +
+             (macdBear ? wMacd : 0) + (squeezeBear ? wSqueeze : 0) + (volumeBear ? wVolume : 0) +
+             (zoneBear ? wZone : 0)
+
+bullScorePct = totalWeight == 0 ? 0 : bullScore / totalWeight * 100
+bearScorePct = totalWeight == 0 ? 0 : bearScore / totalWeight * 100
+
+// ---------------------------------------------------------------------------
+// Session filter
+// ---------------------------------------------------------------------------
+inLondon = not na(time(timeframe.period, londonSession, "UTC"))
+inNyOverlap = not na(time(timeframe.period, nyOverlap, "UTC"))
+sessionOk = not useSessionFilter or inLondon or inNyOverlap
+
+// ---------------------------------------------------------------------------
+// Timing trigger: an event on THIS bar, not just persistent state
+// ---------------------------------------------------------------------------
+timingBull = stochCrossUp or squeezeReleaseUp or ta.crossover(close, ema9)
+timingBear = stochCrossDown or squeezeReleaseDown or ta.crossunder(close, ema9)
+
+// ---------------------------------------------------------------------------
+// Cooldown tracking
+// ---------------------------------------------------------------------------
+var int lastSignalBar = na
+var string lastSignalDir = na
+
+canSignal(dir) =>
+    na(lastSignalBar) or dir == lastSignalDir or (bar_index - lastSignalBar) >= cooldownBars
+
+rawBuySignal  = sessionOk and timingBull and bullScorePct >= entryThreshold and canSignal("buy")
+rawSellSignal = sessionOk and timingBear and bearScorePct >= entryThreshold and canSignal("sell")
+
+if rawBuySignal
+    lastSignalBar := bar_index
+    lastSignalDir := "buy"
+if rawSellSignal
+    lastSignalBar := bar_index
+    lastSignalDir := "sell"
+
+strongBuy  = rawBuySignal and bullScorePct >= strongThreshold
+strongSell = rawSellSignal and bearScorePct >= strongThreshold
+plainBuy   = rawBuySignal and not strongBuy
+plainSell  = rawSellSignal and not strongSell
+
+var string posDir = na
+if rawBuySignal
+    posDir := "long"
+if rawSellSignal
+    posDir := "short"
+
+exitLong  = posDir == "long" and bullScorePct < exitThreshold
+exitShort = posDir == "short" and bearScorePct < exitThreshold
+if exitLong or exitShort
+    posDir := na
+
+// ---------------------------------------------------------------------------
+// Risk levels (informational)
+// ---------------------------------------------------------------------------
+longStop   = close - atrVal * atrStopMult
+longTp1    = close + atrVal * atrStopMult * rr1
+longTp2    = close + atrVal * atrStopMult * rr2
+shortStop  = close + atrVal * atrStopMult
+shortTp1   = close - atrVal * atrStopMult * rr1
+shortTp2   = close - atrVal * atrStopMult * rr2
+
+// ---------------------------------------------------------------------------
+// Plots
+// ---------------------------------------------------------------------------
+plot(ema9, "EMA 9", color = color.new(color.yellow, 0))
+plot(ema21, "EMA 21", color = color.new(color.orange, 0))
+plot(ema50, "EMA 50", color = color.new(color.red, 0))
+plot(vwapVal, "VWAP", color = color.new(color.blue, 0))
+
+bgcolor(squeezeOn ? color.new(color.purple, 85) : na, title = "Squeeze")
+
+plotshape(strongBuy, title = "Strong Buy", style = shape.triangleup, location = location.belowbar,
+     color = color.new(color.lime, 0), size = size.small, text = "SB")
+plotshape(plainBuy, title = "Buy", style = shape.triangleup, location = location.belowbar,
+     color = color.new(color.green, 30), size = size.tiny, text = "B")
+plotshape(strongSell, title = "Strong Sell", style = shape.triangledown, location = location.abovebar,
+     color = color.new(color.red, 0), size = size.small, text = "SS")
+plotshape(plainSell, title = "Sell", style = shape.triangledown, location = location.abovebar,
+     color = color.new(color.maroon, 30), size = size.tiny, text = "S")
+plotshape(exitLong or exitShort, title = "Exit", style = shape.xcross, location = location.absolute,
+     color = color.new(color.gray, 0), size = size.tiny)
+
+plot(rawBuySignal ? longStop : na, "Long Stop", color = color.new(color.red, 0), style = plot.style_circles)
+plot(rawBuySignal ? longTp1 : na, "Long TP1", color = color.new(color.green, 0), style = plot.style_circles)
+plot(rawBuySignal ? longTp2 : na, "Long TP2", color = color.new(color.green, 40), style = plot.style_circles)
+plot(rawSellSignal ? shortStop : na, "Short Stop", color = color.new(color.red, 0), style = plot.style_circles)
+plot(rawSellSignal ? shortTp1 : na, "Short TP1", color = color.new(color.green, 0), style = plot.style_circles)
+plot(rawSellSignal ? shortTp2 : na, "Short TP2", color = color.new(color.green, 40), style = plot.style_circles)
+
+// ---------------------------------------------------------------------------
+// Confluence breakdown table
+// ---------------------------------------------------------------------------
+var table infoTable = table.new(position.top_right, 2, 9, border_width = 1)
+if barstate.islast
+    table.cell(infoTable, 0, 0, "Component", bgcolor = color.new(color.gray, 60), text_color = color.white)
+    table.cell(infoTable, 1, 0, "Bull/Bear", bgcolor = color.new(color.gray, 60), text_color = color.white)
+    table.cell(infoTable, 0, 1, "Trend (EMA)")
+    table.cell(infoTable, 1, 1, trendBull ? "Bull" : trendBear ? "Bear" : "-")
+    table.cell(infoTable, 0, 2, "VWAP")
+    table.cell(infoTable, 1, 2, vwapBull ? "Bull" : "Bear")
+    table.cell(infoTable, 0, 3, "Stoch RSI")
+    table.cell(infoTable, 1, 3, stochBull ? "Bull" : "Bear")
+    table.cell(infoTable, 0, 4, "MACD Hist")
+    table.cell(infoTable, 1, 4, macdBull ? "Bull" : macdBear ? "Bear" : "-")
+    table.cell(infoTable, 0, 5, "Squeeze")
+    table.cell(infoTable, 1, 5, squeezeBull ? "Bull" : squeezeBear ? "Bear" : "-")
+    table.cell(infoTable, 0, 6, "Volume")
+    table.cell(infoTable, 1, 6, volumeBull ? "Bull" : volumeBear ? "Bear" : "-")
+    table.cell(infoTable, 0, 7, "Zone")
+    table.cell(infoTable, 1, 7, zoneBull ? "Bull" : zoneBear ? "Bear" : "-")
+    table.cell(infoTable, 0, 8, "Score", bgcolor = color.new(color.gray, 70), text_color = color.white)
+    table.cell(infoTable, 1, 8, str.tostring(math.round(bullScorePct)) + " / " + str.tostring(math.round(bearScorePct)),
+         bgcolor = color.new(color.gray, 70), text_color = color.white)
+
+// ---------------------------------------------------------------------------
+// Alerts
+// ---------------------------------------------------------------------------
+alertcondition(strongBuy, "Strong Buy", "Confluence Scalper: Strong Buy signal")
+alertcondition(plainBuy, "Buy", "Confluence Scalper: Buy signal")
+alertcondition(strongSell, "Strong Sell", "Confluence Scalper: Strong Sell signal")
+alertcondition(plainSell, "Sell", "Confluence Scalper: Sell signal")
+alertcondition(exitLong or exitShort, "Exit", "Confluence Scalper: Exit signal - confluence deteriorating")
