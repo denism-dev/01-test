@@ -141,6 +141,52 @@ system relies on so they're visible on the chart, not left to guesswork:
 ## 8. Reference implementation
 
 `indicators/confluence_scalper.pine` — a TradingView Pine Script v5
-indicator implementing all seven components, the scoring/gating logic, an
-on-chart confluence table, plotted stop/target levels, and alert
-conditions for Strong Buy / Buy / Strong Sell / Sell / Exit.
+**strategy** (not a plain indicator) implementing all seven components, the
+scoring/gating logic, real bracket orders (stop + two take-profit legs),
+an on-chart confluence table, and alert conditions for Strong Buy / Buy /
+Strong Sell / Sell.
+
+Because it is a `strategy()` script, TradingView's Strategy Tester reports
+real win rate, profit factor, average win/loss, and max drawdown from
+actual filled orders — not from a persistent-state proxy. A second on-chart
+table computes the breakdowns Strategy Tester doesn't give you natively:
+TP1 vs TP2 vs stop-loss hit rate, long vs short win rate, and P/L by
+session (London / NY overlap / other), by replaying `strategy.closedtrades`
+and matching each closed trade back to the direction/session recorded at
+its entry.
+
+Key configurable behaviors, added after an initial indicator-only draft was
+reviewed and found to only *look* like a signal generator with backtestable
+claims attached, without actually producing any of them:
+
+- **Signal Evaluation** (Closed Bar / Intrabar) — Closed Bar avoids
+  repainting by only evaluating signals on a confirmed bar.
+- **Require price-action confirmation** — forces at least the volume or
+  liquidity-zone component to agree, so a signal can't clear the score
+  threshold on trend/momentum/squeeze alone.
+- **Same-direction vs opposite-direction cooldowns** — kept separate so
+  clustered same-direction signals from one sustained move aren't
+  miscounted as independent trades.
+- **Fast triggers toggle** — off by default, because using the Stoch-RSI
+  cross or squeeze release as *both* the timing trigger and a scored
+  component double-counts that evidence; documented in-line rather than
+  silently left in.
+- **Timezone-aware sessions** — London/NY windows are defined against IANA
+  timezones so they stay aligned through DST rather than drifting against
+  fixed UTC offsets.
+
+## 9. Known limitations / what's still unverified
+
+- The script has not been compiled or run in TradingView's Pine Editor —
+  syntax and runtime behavior (especially the paired-`strategy.exit`
+  bracket pattern for TP1/TP2 sharing one stop) should be verified there
+  before trusting any output.
+- No backtest has been run. Nothing in this document or the code is
+  evidence the strategy is profitable — that can only come from running it
+  per the validation plan in Section 7, across multiple instruments,
+  timeframes, and regimes, with walk-forward re-optimization of the
+  component weights.
+- The by-session and TP1/TP2/SL breakdown logic assumes trades close in
+  the same order they open (`pyramiding = 0`, one open position at a
+  time). If that assumption is relaxed, the array-index matching those
+  breakdowns rely on would need to be redone with per-trade IDs instead.
