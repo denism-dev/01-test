@@ -84,6 +84,9 @@ input int      InpMaxOpenTrades        = 3;          // Max concurrent EA positi
 input int      InpMaxTradesPerDay      = 6;          // Max new entries per day
 input double   InpMaxDailyLossPercent  = 5.0;        // Daily equity-drawdown kill-switch
 input int      InpPendingExpiryBars    = 20;         // Bars before an unfilled pending order is cancelled
+input bool     InpFilterTinyStops      = true;       // Reject OBs whose SL distance is unrealistically tight
+input double   InpMinStopPoints        = 50;         // Minimum OB risk distance required, in points
+input double   InpMaxMarginUsagePercent= 50.0;       // Max % of free margin a single new order may consume
 
 input group "=== Trade Management ==="
 input bool     InpPartialCloseAtTP1    = true;       // Close part of the position at TP1 (3R)
@@ -455,6 +458,15 @@ void ValidateOB(OrderBlockInfo &ob,int obShift,int breakoutShift)
    bool pass=true;
    string reasons="";
 
+   //--- Practical safety filter (not one of the 6 strategy rules): reject OBs whose SL distance is
+   //    so tight that risk-based lot sizing would need an oversized position to risk InpRiskPercent,
+   //    which can exceed available margin (tight stops are also more prone to spread/noise stop-outs).
+   if(InpFilterTinyStops && ob.risk<InpMinStopPoints*_Point)
+     {
+      pass=false;
+      reasons+="TinyStopFilter;";
+     }
+
    double atrVal=GetATR(obShift);
    double proxTol=atrVal*InpProximityATRMult;
 
@@ -655,6 +667,33 @@ int CountValidOBs()
 //====================================================================================================
 // TRADE EXECUTION & MANAGEMENT
 //====================================================================================================
+// Ensures the position we are about to open cannot exceed InpMaxMarginUsagePercent of free margin;
+// scales the lot down (respecting the volume step/min) or refuses the trade if even the minimum
+// lot would breach the cap. Prevents "not enough money for order" failures that a purely
+// risk-percent based lot size can produce when an Order Block's stop distance is very tight
+// (small risk-in-price does NOT mean small margin requirement - leverage does not care about pips).
+bool CapLotByMargin(ENUM_ORDER_TYPE orderType,double price,double &lot)
+  {
+   double margin=0.0;
+   if(!OrderCalcMargin(orderType,_Symbol,lot,price,margin)) return false;
+   double freeMargin=AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double allowed=freeMargin*(InpMaxMarginUsagePercent/100.0);
+   if(margin<=allowed) return true;
+
+   double minV=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   double step=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+   if(step<=0) step=0.01;
+
+   double scaled=NormalizeVolume(lot*(allowed/margin));
+   while(scaled>=minV)
+     {
+      if(!OrderCalcMargin(orderType,_Symbol,scaled,price,margin)) return false;
+      if(margin<=allowed) { lot=scaled; return true; }
+      scaled=NormalizeVolume(scaled-step);
+     }
+   return false; // even the minimum lot would exceed the allowed margin usage
+  }
+
 void PlacePendingOrder(OrderBlockInfo &ob)
   {
    if(!InpEnableTrading) return;
@@ -677,6 +716,14 @@ void PlacePendingOrder(OrderBlockInfo &ob)
 
    double lot = (InpFixedLots>0) ? NormalizeVolume(InpFixedLots) : CalcLotByRisk(ob.risk);
    if(lot<=0) return;
+
+   ENUM_ORDER_TYPE orderType=(ob.type==OB_BULLISH)?ORDER_TYPE_BUY_LIMIT:ORDER_TYPE_SELL_LIMIT;
+   if(!CapLotByMargin(orderType,ob.entry,lot))
+     {
+      PrintFormat("[OB-EA] Skipped %s OB @ %s - insufficient free margin even at minimum lot",
+                  ob.type==OB_BULLISH?"BULLISH":"BEARISH",TimeToString(ob.time,TIME_DATE|TIME_MINUTES));
+      return;
+     }
 
    datetime expiry=TimeCurrent()+(datetime)(InpPendingExpiryBars*PeriodSeconds(_Period));
 

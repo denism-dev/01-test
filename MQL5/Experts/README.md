@@ -43,6 +43,12 @@ transparency, but are **never** traded.
 - **Two-target management** — TP1 (3R) triggers a partial close + move to break-even; the runner is
   then ATR-trailed toward TP2 (6R by default), all handled automatically per position.
 - **Daily loss kill-switch, max concurrent trades, max trades/day, spread filter, session filter.**
+- **Margin-aware position sizing** — a purely pip-risk-based lot size can demand far more margin than
+  the account has when an Order Block's stop is very tight (small price-risk ≠ small margin
+  requirement). `InpFilterTinyStops`/`InpMinStopPoints` reject unrealistically tight OBs outright, and
+  `CapLotByMargin()` additionally caps every order to `InpMaxMarginUsagePercent` of free margin via
+  `OrderCalcMargin()`, scaling the lot down (or skipping the trade if even the minimum lot won't fit)
+  instead of sending an order the broker will simply reject as "not enough money".
 - **Pending-order lifecycle management** — auto-expiry, and automatic cancellation of an opposite-side
   pending order the moment a fresh opposite Break of Structure invalidates it.
 - **On-chart dashboard, OB/SSR visualization, alerts & push notifications.**
