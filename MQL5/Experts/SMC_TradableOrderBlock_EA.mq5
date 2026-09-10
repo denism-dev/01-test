@@ -766,6 +766,61 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,const MqlTradeRequest &
      }
   }
 
+// The CTrade wrapper's PositionModify()/PositionClosePartial() only have symbol-based overloads,
+// and on a hedging account a symbol-based call can silently act on the WRONG position when more
+// than one position is open on the same symbol (broker modifies "the position with the lowest
+// ticket"). Since this EA can hold several concurrent positions on one symbol, position modify and
+// partial-close are done here with raw MqlTradeRequest calls that pin the exact ticket via
+// request.position - this is unambiguous under both netting and hedging accounting.
+ENUM_ORDER_TYPE_FILLING GetFillingMode(const string symbol)
+  {
+   long filling=SymbolInfoInteger(symbol,SYMBOL_FILLING_MODE);
+   if((filling & SYMBOL_FILLING_FOK)!=0) return ORDER_FILLING_FOK;
+   if((filling & SYMBOL_FILLING_IOC)!=0) return ORDER_FILLING_IOC;
+   return ORDER_FILLING_RETURN;
+  }
+
+bool ModifyPositionByTicket(ulong ticket,double sl,double tp)
+  {
+   if(!PositionSelectByTicket(ticket)) return false;
+   MqlTradeRequest request; MqlTradeResult result;
+   ZeroMemory(request); ZeroMemory(result);
+   request.action   = TRADE_ACTION_SLTP;
+   request.position = ticket;
+   request.symbol   = PositionGetString(POSITION_SYMBOL);
+   request.sl       = NormalizeDouble(sl,_Digits);
+   request.tp       = NormalizeDouble(tp,_Digits);
+   if(!OrderSend(request,result))
+     {
+      PrintFormat("[OB-EA] Modify failed for #%I64u: %d %s",ticket,result.retcode,result.comment);
+      return false;
+     }
+   return (result.retcode==TRADE_RETCODE_DONE);
+  }
+
+bool ClosePartialByTicket(ulong ticket,double volume)
+  {
+   if(!PositionSelectByTicket(ticket)) return false;
+   string symbol   = PositionGetString(POSITION_SYMBOL);
+   long   posType  = PositionGetInteger(POSITION_TYPE);
+   MqlTradeRequest request; MqlTradeResult result;
+   ZeroMemory(request); ZeroMemory(result);
+   request.action       = TRADE_ACTION_DEAL;
+   request.position     = ticket;
+   request.symbol       = symbol;
+   request.volume       = volume;
+   request.deviation    = 20;
+   request.type_filling = GetFillingMode(symbol);
+   request.type  = (posType==POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+   request.price = (posType==POSITION_TYPE_BUY) ? SymbolInfoDouble(symbol,SYMBOL_BID) : SymbolInfoDouble(symbol,SYMBOL_ASK);
+   if(!OrderSend(request,result))
+     {
+      PrintFormat("[OB-EA] Partial close failed for #%I64u: %d %s",ticket,result.retcode,result.comment);
+      return false;
+     }
+   return (result.retcode==TRADE_RETCODE_DONE || result.retcode==TRADE_RETCODE_DONE_PARTIAL);
+  }
+
 void ManageOpenPositions()
   {
    for(int i=ArraySize(g_managedTrades)-1; i>=0; i--)
@@ -787,14 +842,14 @@ void ManageOpenPositions()
             double closeVol=NormalizeVolume(vol*InpPartialClosePercent/100.0);
             double minV=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
             if(closeVol>=minV && closeVol<vol)
-               trade.PositionClosePartial(ticket,closeVol);
+               ClosePartialByTicket(ticket,closeVol);
             g_managedTrades[i].partialDone=true;
 
             if(InpMoveSLToBEOnTP1)
               {
                double be = isBuy ? g_managedTrades[i].entry+InpBreakEvenBufferPts*_Point
                                   : g_managedTrades[i].entry-InpBreakEvenBufferPts*_Point;
-               trade.PositionModify(ticket,be,curTP);
+               ModifyPositionByTicket(ticket,be,curTP);
                g_managedTrades[i].beDone=true;
               }
             continue;
@@ -807,7 +862,7 @@ void ManageOpenPositions()
          double newSL = isBuy ? price-atr*InpTrailATRMultiplier : price+atr*InpTrailATRMultiplier;
          bool improve = isBuy ? (newSL>curSL) : (curSL==0 || newSL<curSL);
          if(improve)
-            trade.PositionModify(ticket,newSL,curTP);
+            ModifyPositionByTicket(ticket,newSL,curTP);
         }
      }
   }
